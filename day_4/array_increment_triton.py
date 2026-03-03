@@ -1,14 +1,14 @@
-/*
- * Array Increment Triton Implementation: High-Performance Element-wise Increment
- * Math: A[i] = A[i] + 1 for all i in [0, N)
- * Inputs: A[N] - input array, N - array length
- * Assumptions: N > 0, array is contiguous, device has sufficient memory
- * Parallel Strategy: Each block processes multiple elements with coalesced access
- * Mixed Precision Policy: FP16/BF16 for computation, FP32 for reductions
- * Distributed Hooks: Ready for tensor parallelism via tl.comm_* primitives
- * Complexity: O(N) FLOPs, O(N) bytes moved
- * Test Vectors: Deterministic random arrays with known increments
- */
+"""
+Array Increment Triton Implementation: High-Performance Element-wise Increment
+Math: A[i] = A[i] + 1 for all i in [0, N)
+Inputs: A[N] - input array, N - array length
+Assumptions: N > 0, array is contiguous, device has sufficient memory
+Parallel Strategy: Each block processes multiple elements with coalesced access
+Mixed Precision Policy: FP16/BF16 for computation, FP32 for reductions
+Distributed Hooks: Ready for tensor parallelism via tl.comm_* primitives
+Complexity: O(N) FLOPs, O(N) bytes moved
+Test Vectors: Deterministic random arrays with known increments
+"""
 
 import torch
 import triton
@@ -87,14 +87,16 @@ def array_increment_optimized_kernel(
     for i in range(block_start, block_end, 4):
         # Process 4 elements at a time
         if i + 3 < block_end:
-            # Load 4 elements
-            vals = tl.load(array_ptr + i, mask=tl.arange(0, 4) + i < block_end)
+            # Load 4 elements: pointer must be vector for vectorized load
+            offsets = tl.arange(0, 4)
+            mask = (i + offsets) < block_end
+            vals = tl.load(array_ptr + i + offsets, mask=mask)
             
             # Increment
             vals += 1
             
-            # Store results
-            tl.store(array_ptr + i, vals, mask=tl.arange(0, 4) + i < block_end)
+            # Store results: pointer must be vector for vectorized store
+            tl.store(array_ptr + i + offsets, vals, mask=mask)
         else:
             # Handle remaining elements
             for j in range(i, min(i + 4, block_end)):
@@ -128,21 +130,21 @@ def array_increment_triton(
     # Ensure tensor is on correct device
     array = array.to(device)
     
-    # Calculate grid dimensions
-    grid_size = triton.cdiv(N, 256)  # Default block size for grid calculation
+    # Grid must derive from BLOCK_SIZE: use callable so autotune's selected
+    # BLOCK_SIZE is respected (Bug 3 fix: hardcoded 256 would mismatch autotuned configs)
+    grid = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE']),)
     
     # Launch kernel
     if optimized:
-        array_increment_optimized_kernel[(grid_size,)](
+        array_increment_optimized_kernel[grid](
             array,
             N,
-            BLOCK_SIZE=256,  # Will be overridden by autotune
+            BLOCK_SIZE=256,
         )
     else:
-        array_increment_kernel[(grid_size,)](
+        array_increment_kernel[grid](
             array,
             N,
-            BLOCK_SIZE=256,  # Will be overridden by autotune
         )
     
     return array
@@ -307,8 +309,8 @@ if __name__ == "__main__":
     
     print("\n=== All tests passed! ===")
 
-/*
- * Profiling example & performance tips:
+"""
+Profiling example & performance tips:
  * 
  * 1. Use nsys profile to analyze kernel performance:
  *    nsys profile --trace=cuda python array_increment_triton.py
@@ -331,4 +333,4 @@ if __name__ == "__main__":
  *    - Use tl.comm_* primitives for multi-GPU operations
  *    - Implement gradient synchronization for distributed training
  *    - Consider memory-efficient implementations for large models
- */
+"""
