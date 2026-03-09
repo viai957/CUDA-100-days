@@ -195,3 +195,181 @@ int main() {
     test_gemm(1024, 1024, 512, 16);
     return 0;
 }
+
+/*
+ * Day 7 - Matrix Transpose (CUDA): Row-major tiled transpose with stride-style indexing
+ *
+ * Math:
+ *   Given A[M, N] row-major, produce B[N, M] where:
+ *     B[n, m] = A[m, n]
+ *
+ * Inputs / Outputs:
+ *   A: float[M, N] row-major, leading dim lda (typically N)
+ *   B: float[N, M] row-major, leading dim ldb (typically M)
+ *
+ * Assumptions:
+ * - A, B are contiguous row-major buffers unless lda/ldb specify padding
+ * - M, N > 0
+ *
+ * Parallel Strategy:
+ * - 2D grid of TILE x TILE threadblocks (TILE = 32)
+ * - Each block loads a TILE x TILE tile from A into shared memory, then writes
+ *   the transposed TILE x TILE tile into B.
+ * - Shared memory is declared as tile[TILE][TILE+1] to avoid bank conflicts.
+ *
+ * Stride-style Indexing (PyTorch-style intuition):
+ * - Row-major element address:  idx(A[m, n]) = m * lda + n
+ * - Transposed row-major B[n, m]: idx(B[n, m]) = n * ldb + m
+ * - This mirrors PyTorch's logical `transpose` view where strides are swapped:
+ *     in_strides  = (lda, 1)
+ *     out_strides = (ldb, 1) for B[n, m], effectively using swapped logical dims.
+ *
+ * Mixed Precision Policy:
+ * - FP32 loads and FP32 stores (educational baseline)
+ *
+ * Complexity:
+ * - FLOPs: ~0 (pure data movement)
+ * - Bytes moved: (M*N + M*N) * sizeof(float)
+ *
+ * Build:
+ *   nvcc -O3 -lineinfo -std=c++17 day_7/matrix_transpose.cu -o /tmp/matrix_transpose
+ */
+
+ #include <cuda.h>
+ #include <cuda_runtime.h>
+ 
+ #include <assert.h>
+ #include <math.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+ #include "cuda_common.cuh"
+ 
+ using EL_TYPE = float;
+ 
+ static inline EL_TYPE frand01() {
+     return (EL_TYPE)rand() / (EL_TYPE)RAND_MAX;
+ }
+ 
+ // TILE should be 32 for best memory coalescing on modern GPUs.
+ constexpr int TILE_DIM = 32;
+ 
+ // Row-major tiled transpose:
+ // A: [M x N], lda (leading dimension for N)
+ // B: [N x M], ldb (leading dimension for M)
+ __global__ void cuda_transpose_tiled(const EL_TYPE *__restrict__ A,
+                                      EL_TYPE *__restrict__ B,
+                                      int M, int N,
+                                      int lda, int ldb) {
+     __shared__ EL_TYPE tile[TILE_DIM][TILE_DIM + 1]; // +1 to avoid bank conflicts
+ 
+     const int x = (int)blockIdx.x * TILE_DIM + (int)threadIdx.x; // column in A
+     const int y = (int)blockIdx.y * TILE_DIM + (int)threadIdx.y; // row in A
+ 
+     if (y < M && x < N) {
+         tile[threadIdx.y][threadIdx.x] = A[(size_t)y * (size_t)lda + (size_t)x];
+     } else {
+         tile[threadIdx.y][threadIdx.x] = 0.0f;
+     }
+ 
+     __syncthreads();
+ 
+     // Transposed block coordinates:
+     const int x_t = (int)blockIdx.y * TILE_DIM + (int)threadIdx.x; // column in B (m)
+     const int y_t = (int)blockIdx.x * TILE_DIM + (int)threadIdx.y; // row in B (n)
+ 
+     if (y_t < N && x_t < M) {
+         B[(size_t)y_t * (size_t)ldb + (size_t)x_t] = tile[threadIdx.x][threadIdx.y];
+     }
+ }
+ 
+ static void cpu_transpose_ref(const EL_TYPE *A, EL_TYPE *B, int M, int N) {
+     const int lda = N;
+     const int ldb = M;
+     for (int m = 0; m < M; m++) {
+         for (int n = 0; n < N; n++) {
+             // B[n, m] = A[m, n]
+             B[(size_t)n * (size_t)ldb + (size_t)m] =
+                 A[(size_t)m * (size_t)lda + (size_t)n];
+         }
+     }
+ }
+ 
+ static void test_transpose(int M, int N) {
+     printf("Transpose: A[%d x %d] (row-major) -> B[%d x %d]\n", M, N, N, M);
+ 
+     const size_t bytes_A = (size_t)M * (size_t)N * sizeof(EL_TYPE);
+     const size_t bytes_B = (size_t)N * (size_t)M * sizeof(EL_TYPE);
+ 
+     EL_TYPE *hA = (EL_TYPE *)malloc(bytes_A);
+     EL_TYPE *hB = (EL_TYPE *)malloc(bytes_B);
+     EL_TYPE *hB_ref = (EL_TYPE *)malloc(bytes_B);
+     assert(hA && hB && hB_ref);
+ 
+     for (int i = 0; i < M * N; i++) {
+         hA[i] = (frand01() - 0.5f) * 2.0f;
+     }
+ 
+     EL_TYPE *dA = nullptr;
+     EL_TYPE *dB = nullptr;
+     CUDA_CHECK(cudaMalloc((void **)&dA, bytes_A));
+     CUDA_CHECK(cudaMalloc((void **)&dB, bytes_B));
+     CUDA_CHECK(cudaMemcpy(dA, hA, bytes_A, cudaMemcpyHostToDevice));
+ 
+     dim3 block(TILE_DIM, TILE_DIM, 1);
+     dim3 grid((N + TILE_DIM - 1) / TILE_DIM,
+               (M + TILE_DIM - 1) / TILE_DIM,
+               1);
+ 
+     cudaEvent_t start, stop;
+     CUDA_CHECK(cudaEventCreate(&start));
+     CUDA_CHECK(cudaEventCreate(&stop));
+ 
+     // Warmup
+     for (int i = 0; i < 5; i++) {
+         cuda_transpose_tiled<<<grid, block>>>(dA, dB, M, N, N, M);
+     }
+     CUDA_CHECK_KERNEL();
+ 
+     CUDA_CHECK(cudaEventRecord(start));
+     cuda_transpose_tiled<<<grid, block>>>(dA, dB, M, N, N, M);
+     CUDA_CHECK(cudaEventRecord(stop));
+     CUDA_CHECK(cudaEventSynchronize(stop));
+     float ms = 0.0f;
+     CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+     printf("CUDA transpose kernel time: %.3f ms\n", ms);
+ 
+     CUDA_CHECK(cudaMemcpy(hB, dB, bytes_B, cudaMemcpyDeviceToHost));
+ 
+     // CPU reference + check
+     cpu_transpose_ref(hA, hB_ref, M, N);
+     float max_abs_err = 0.0f;
+     for (int i = 0; i < M * N; i++) {
+         float diff = fabsf((float)hB[i] - (float)hB_ref[i]);
+         if (diff > max_abs_err) {
+             max_abs_err = diff;
+         }
+     }
+     printf("max|B - B_ref| = %.6e\n", max_abs_err);
+     if (max_abs_err < 1e-6f) {
+         printf("Result OK\n");
+     } else {
+         printf("Result MISMATCH\n");
+     }
+ 
+     CUDA_CHECK(cudaFree(dA));
+     CUDA_CHECK(cudaFree(dB));
+     free(hA);
+     free(hB);
+     free(hB_ref);
+ }
+ 
+ int main() {
+     srand(0);
+ 
+     // Square and non-square sizes, including non-multiples of TILE_DIM
+     test_transpose(128, 128);
+     test_transpose(512, 256);
+     test_transpose(513, 1027);
+     return 0;
+ }
